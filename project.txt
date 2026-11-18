@@ -1,0 +1,403 @@
+================================================================================
+ AI 와인 소믈리에 API (React 연동 FastAPI 백엔드) - 프로젝트 구성 문서
+================================================================================
+ 참조 : D:\fastapiworkspace\fastapiproject (FastAPI + Jinja2 화면)
+ 대상 : D:\fastapiworkspace\reactbackend   (FastAPI JSON API, 화면은 React 담당)
+ 
+
+1. 프로젝트 개요
+--------------------------------------------------------------------------------
+ - fastapiproject의 기능을 React에서 호출하는 JSON API 서버로 변경했다.
+   (Jinja2 템플릿, CSS, JavaScript는 제거. 화면은 별도의 React 프로젝트에서 만든다.)
+ - 이 프로젝트에는 React 코드가 없다. React 연결 방법은 "8. React 연동 방법"을 참고한다.
+ - data 폴더의 와인 데이터를 ChromaDB에 임베딩해 저장하고 유사도 검색을 한다.
+ - 제공 기능
+     · 벡터 DB 상태 조회 (React 홈 화면용)
+     · 와인 정보 검색 (벡터 기반, 유사도 점수 포함)
+     · 가격/재고 필터
+     · AI 소믈리에 챗봇 (대화 기록 유지)
+     · YouTube 와인 영상 추천
+ - React에서 접근할 때 필요한 CORS와 보안 설정을 적용했다. ("6. CORS / 보안 설정")
+
+
+2. 전체 아키텍처
+--------------------------------------------------------------------------------
+
+  ┌──────────────────── React 앱 (브라우저, 별도 프로젝트) ───────────────┐
+  │   홈 화면               와인 검색 화면              와인 챗봇 화면      │
+  └─────────┬───────────────────┬────────────────────────┬──────────────┘
+            │ fetch(JSON)  +  credentials: "include"  (쿠키 wine_thread_id)
+            │ 개발 시 : Vite 프록시(/api) 또는 직접 호출(CORS)
+  ┌─────────▼───────────────────▼────────────────────────▼────────────────┐
+  │                      FastAPI  (backend/main.py)                       │
+  │                                                                       │
+  │  common/security.py   보안 미들웨어 (요청은 위에서 아래로 통과)            │
+  │     1) 보안 헤더                                                       │
+  │     2) 호스트 검사 (TrustedHost)                                       │
+  │     3) CORS (허용한 React 주소만)                                      │
+  │     4) 오류 처리 (모든 오류를 CORS 헤더가 있는 JSON으로 응답)            │
+  │     5) 요청 검사 (다른 사이트의 POST/DELETE 차단, 요청 크기 제한)        │
+  │                                                                       │
+  │  home/      GET  /api/home                                            │
+  │  search/    GET  /api/search           (IP별 호출 제한)                │
+  │  chat/      POST /api/chat             (IP별 호출 제한)                │
+  │             GET, DELETE /api/chat/history                             │
+  │             에이전트 도구 - search_wine : DB 검색 (필터 포함)            │
+  │                           - youtube_search : 영상 검색                │
+  │  vectordb/  ChromaDB 연결, 유사도/MMR 검색                             │
+  └─────┬───────────────────────────────────────────────────┬─────────────┘
+        │                                                   │
+  ┌─────▼──────────────────────────────────┐   ┌────────────▼──────────┐
+  │ storage/  (실행 중 생성되는 파일)        │   │ 외부 서비스             │
+  │   chromadb/      ChromaDB 벡터 저장소   │   │   OpenAI API          │
+  │   wine_chat.db   대화 기록 (SQLite)     │   │   YouTube 검색        │
+  └─────▲──────────────────────────────────┘   └───────────────────────┘
+        │ 임베딩 저장 (개발자가 직접 실행, 데이터 변경 시 재실행)
+  ┌─────┴────────────────────────┐   ┌─────────────────────┐
+  │ vectordb/create_vector_db.py │◄──│ data/wine_brief.csv │
+  │ 로드 → 청킹 → 임베딩           │   │ data/wine_detail.md │
+  └──────────────────────────────┘   └─────────────────────┘
+
+
+3. 처리 흐름
+--------------------------------------------------------------------------------
+ [임베딩] python vectordb/create_vector_db.py
+   wine_brief.csv → 행 1개 = 청크 1개 (60개, source_type = Structured Data)
+   wine_detail.md → 와인 1개 = 청크 1개 (60개, source_type = Unstructured Data)
+   → text-embedding-3-small 임베딩 → ChromaDB 저장(코사인 거리)
+   · 청크마다 고정 id를 사용하므로 다시 실행해도 중복 저장되지 않는다.
+
+ [유사도 검색] GET /api/search
+   검색어 임베딩 + 가격/재고 조건(where) → ChromaDB 코사인 유사도 검색
+   → 와인 단위로 묶어 점수와 함께 JSON으로 응답
+   · 가격 조건을 지정하면 가격 미정 와인은 제외된다.
+
+ [챗봇] POST /api/chat
+   React → chat/router.py → run_agent()
+     → LLM(gpt-5-nano)이 필요한 도구 선택 → 도구 실행 → 최종 답변
+     → 질문 1개당 LLM 호출은 최대 6회 (초과하면 안내 문구로 종료)
+     → 대화 기록은 storage/wine_chat.db에 저장 (HttpOnly 쿠키 wine_thread_id로 구분)
+     → 답변은 마크다운 원문으로 응답. React에서 react-markdown으로 렌더링한다.
+
+
+4. 파일 구성도
+--------------------------------------------------------------------------------
+ reactbackend/
+ ├─ .env                        OPENAI_API_KEY (Git에 올리지 않음)
+ ├─ .gitignore                  .env, .venv, storage 등 제외
+ ├─ requirements.txt            라이브러리 목록 (pip freeze, 126개)
+ ├─ project.txt                 이 문서
+ ├─ .idea/                      PyCharm 설정 (backend를 Sources Root로 등록)
+ ├─ .venv/                      가상환경
+ └─ backend/                    ※ 실행 위치
+    ├─ main.py                  FastAPI 앱 생성, 보안 설정 적용, 라우터 연결
+    │
+    │  --- 기능별 폴더 ---
+    ├─ common/                  공통
+    │   ├─ config.py            모델, 프롬프트, 경로, 보안 설정값 + 위험한 설정 검사
+    │   └─ security.py          CORS, 보안 헤더, CSRF 방어, 호출 제한, 오류 처리
+    ├─ home/                    홈
+    │   ├─ router.py            GET / (서버 확인), GET /api/home
+    │   └─ schemas.py           응답 스키마
+    ├─ search/                  와인 검색
+    │   ├─ router.py            GET /api/search
+    │   └─ schemas.py           요청/응답 스키마, 가격 조건 타입
+    ├─ chat/                    와인 챗봇
+    │   ├─ router.py            POST /api/chat, GET, DELETE /api/chat/history, 쿠키 발급
+    │   ├─ schemas.py           요청/응답 스키마
+    │   ├─ agent_builder.py     에이전트 생성/실행/대화 조회, LLM 호출 횟수 제한
+    │   └─ wine_tools.py        에이전트 도구 search_wine
+    ├─ vectordb/                임베딩, ChromaDB
+    │   ├─ create_vector_db.py  데이터 전처리 + 임베딩 저장 (개발자가 직접 실행)
+    │   └─ wine_store.py        ChromaDB 연결, 유사도/MMR 검색, 필터
+    ├─ data/                    원본 데이터
+    │   ├─ wine_brief.csv       60종 기본정보 (이름, 빈티지, 지역, 가격, 재고량)
+    │   └─ wine_detail.md       60종 상세정보 (한식 페어링, 테이스팅 노트)
+    │
+    │  --- 실행하면 자동으로 생성되는 항목 ---
+    └─ storage/
+        ├─ chromadb/            ChromaDB 파일 (create_vector_db.py 실행 시)
+        └─ wine_chat.db         대화 기록 SQLite (서버 시작 시)
+
+ ※ 기능 폴더의 __init__.py는 패키지를 표시하는 빈 파일이다.
+
+
+5. API 목록
+--------------------------------------------------------------------------------
+ API 문서와 테스트 화면 : http://localhost:8000/docs (ENABLE_DOCS=true 일 때)
+
+ GET /api/home  벡터 DB 상태. ready가 false이면 create_vector_db.py 실행이 필요하다.
+   {"ready": true, "counts": {"structured": 60, "unstructured": 60, "total": 120}}
+
+ GET /api/search  유사도 검색
+   query         : 검색어 (필수, 1~500자)
+   source_type   : all | Structured Data | Unstructured Data (기본 all)
+   k             : 결과 수 1~10 (기본 5)
+   min_price     : 최소 가격, 단위 만원 (빈 값이면 조건 없음)
+   max_price     : 최대 가격, 단위 만원 (빈 값이면 조건 없음)
+   in_stock_only : true이면 재고 있는 와인만
+   예) /api/search?query=불고기&max_price=20&in_stock_only=true
+   {"query": "불고기", "source_type": "all", "k": 5, "min_price": null, "max_price": 20,
+    "in_stock_only": true,
+    "results": [{"name": "...", "vintage": "2019", "region": "Tuscany",
+                 "price": "11 만원", "stock": "452", "price_value": 11.0, "stock_value": 452,
+                 "pairing": "...", "tasting_note": "...", "source_type": "...",
+                 "content": "...", "score": 0.42}]}
+   ※ price_value는 가격 미정이면 null이다. 정형 데이터 결과는 pairing, tasting_note가 빈 문자열이다.
+
+ POST /api/chat  챗봇 질문 (본문 JSON, message 1~2000자)
+   요청 {"message": "불고기에 어울리는 와인 추천해줘"}
+   응답 {"answer": "마크다운 답변", "tools_used": ["search_wine"]}
+   ※ tools_used 값 : search_wine (와인 DB 검색), youtube_search (YouTube 검색)
+
+ GET /api/chat/history     저장된 대화 조회 (새로고침 후 화면 복원용)
+   [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+
+ DELETE /api/chat/history  저장된 대화 삭제 (새 대화). 응답 204, 본문 없음
+
+ GET /  서버 동작 확인용 메시지 (React에서는 사용하지 않음)
+
+ [오류 응답] 모든 오류는 JSON이며 메시지는 detail에 있다.
+   400  등록되지 않은 Host (이 경우만 JSON이 아닌 일반 텍스트)
+   403  허용되지 않은 출처의 POST/DELETE
+   411  Content-Length 없는 요청 (브라우저 fetch, axios는 해당 없음)
+   413  요청 크기 초과 (32KB)
+   422  입력값 오류. ※ detail이 문자열 또는 배열이므로 React에서 구분해야 한다.
+   429  호출 제한 초과. Retry-After 헤더에 최대 대기 시간(초)
+   500  서버 내부 오류 (내부 내용은 응답에 포함하지 않고 서버 로그에만 기록)
+   502  OpenAI 호출 실패
+   503  벡터 DB가 비어 있음 (create_vector_db.py 실행 필요)
+
+
+6. CORS / 보안 설정
+--------------------------------------------------------------------------------
+ 코드 : backend/common/security.py, 설정값 : backend/common/config.py
+
+ 문제 상황                           적용한 방법
+ ──────────────────────────────────  ───────────────────────────────────────────
+ React에서 API 호출 시 CORS 오류     CORS_ORIGINS에 등록한 주소만 허용 (* 사용 금지)
+ 대화 쿠키가 전달되지 않음           allow_credentials=True (React는 credentials 설정)
+ 서버 오류가 CORS 오류로 보임        오류 처리를 CORS 안쪽에 두어 500에도 CORS 헤더 포함
+ 다른 사이트가 사용자 쿠키로         POST/DELETE의 Origin 검사(403) + SameSite=Lax 쿠키
+   API 호출 (CSRF)                   + JSON 외 형식 거부(422)
+ XSS로 대화 id 탈취                  HttpOnly 쿠키 (자바스크립트에서 읽을 수 없음)
+ XSS (LLM 답변에 스크립트 포함)      HTML을 응답하지 않고 마크다운 원문만 응답
+ 임의의 대화 id 주입                 서버가 만든 형식(uuid4)이 아닌 쿠키는 새로 발급
+ DNS 리바인딩, Host 헤더 조작        TrustedHostMiddleware (ALLOWED_HOSTS)
+ OpenAI 비용 남용                    IP별 호출 제한 (slowapi) + 질문당 LLM 호출 최대 6회
+ 대용량 요청                         본문 32KB 제한 + 입력 길이 검증
+ API 키, 내부 오류 노출              오류 내용은 로그에만 기록, 도구 오류는 LLM에도 미전달
+ API 키가 저장소에 올라감            .gitignore에 .env 등록 (React에는 키를 두지 않음)
+ 응답 캐시, 다른 페이지에 삽입       Cache-Control: no-store, X-Frame-Options: DENY, CSP
+ 응답 형식 오인                      X-Content-Type-Options: nosniff
+ 잘못된 보안 설정                    * 사용 등 위험한 값이면 서버가 시작되지 않음
+
+ [환경 변수] .env 에 지정하면 기본값 대신 사용된다. (OPENAI_API_KEY만 필수)
+   변수               기본값                       설명
+   CORS_ORIGINS       localhost, 127.0.0.1의       허용할 React 주소, 쉼표로 구분
+                      5173(Vite), 3000(CRA) 포트
+   ALLOWED_HOSTS      localhost,127.0.0.1          이 API 서버의 도메인, 쉼표로 구분
+   COOKIE_SECURE      false                        HTTPS 배포 시 true (HSTS 헤더도 전송)
+   COOKIE_SAMESITE    lax                          lax | strict | none
+   ENABLE_DOCS        true                         배포 시 false (/docs, /openapi.json 숨김)
+   CHAT_RATE_LIMIT    20/minute                    IP별 챗봇 호출 제한
+   SEARCH_RATE_LIMIT  60/minute                    IP별 검색 호출 제한
+
+ [배포 예시] React https://wine.example.com, API https://api.example.com
+   CORS_ORIGINS=https://wine.example.com
+   ALLOWED_HOSTS=api.example.com
+   COOKIE_SECURE=true
+   COOKIE_SAMESITE=lax      ※ 같은 사이트(example.com)이므로 lax 가능
+   ENABLE_DOCS=false
+   ※ 서로 다른 사이트(예: wine.com ↔ api.net)이면 COOKIE_SAMESITE=none 으로 지정한다.
+     단, 제3자 쿠키를 차단하는 브라우저에서는 쿠키가 전달되지 않을 수 있으므로
+     같은 도메인에서 프록시로 연결하는 구성을 권장한다.
+   실행 : uvicorn main:app --host 127.0.0.1 --port 8000 --no-server-header
+   HTTPS는 Nginx 같은 리버스 프록시에서 처리한다. 프록시 뒤에서는
+   --proxy-headers --forwarded-allow-ips=<프록시 IP> 를 추가해야 호출 제한이 사용자 IP별로 동작한다.
+
+
+7. .env 파일
+--------------------------------------------------------------------------------
+ 프로젝트 루트(reactbackend/.env)에 둔다. 기본값으로 개발할 때는 키만 있으면 된다.
+   OPENAI_API_KEY=발급받은 키
+ ※ 현재 값은 fastapiproject와 같은 키이다. 키를 교체하면 두 프로젝트 모두 변경해야 한다.
+ ※ API 키는 React에 두지 않는다. Vite에서 VITE_ 로 시작하는 값은 브라우저에 그대로 공개된다.
+
+
+8. React 연동 방법
+--------------------------------------------------------------------------------
+ [방법 1 - 권장] Vite 프록시 : 브라우저 입장에서 같은 주소이므로 CORS 문제가 생기지 않는다.
+
+   // vite.config.js
+   export default defineConfig({
+     plugins: [react()],
+     server: {
+       proxy: { "/api": { target: "http://127.0.0.1:8000" } },
+     },
+   });
+   ※ uvicorn은 기본적으로 IPv4(127.0.0.1)에서만 대기하므로 target은 127.0.0.1로 지정한다.
+
+ [방법 2] 직접 호출 : API 주소를 지정하면 CORS 설정으로 동작한다.
+   주소를 지정할 때는 React와 API의 호스트 이름을 반드시 맞춘다.
+     정상  http://localhost:5173  → http://localhost:8000
+     정상  http://127.0.0.1:5173  → http://127.0.0.1:8000
+     문제  http://127.0.0.1:5173  → http://localhost:8000
+           요청은 성공하지만 쿠키가 전달되지 않아, 질문할 때마다 새 대화가 된다.
+           (Chrome에서 대화 조회가 0건으로 나오는 것을 확인함)
+
+ [API 호출 공통 함수] credentials: "include" 를 빠뜨리면 대화가 이어지지 않는다.
+
+   // src/api/client.js
+   const API_BASE = "";   // 직접 호출이면 "http://localhost:8000"
+
+   export async function apiFetch(path, options = {}) {
+     const response = await fetch(API_BASE + path, {
+       credentials: "include",
+       ...options,
+     });
+     if (!response.ok) {
+       const data = await response.json().catch(() => ({}));
+       // 422 입력값 오류는 detail이 배열일 수 있음
+       const message = typeof data.detail === "string" ? data.detail : "요청을 처리하지 못했습니다.";
+       throw new Error(message);
+     }
+     return response.status === 204 ? null : response.json();
+   }
+
+   export const getHome = () => apiFetch("/api/home");
+   export const searchWines = (params) =>
+     apiFetch("/api/search?" + new URLSearchParams(params));
+   export const sendChat = (message) =>
+     apiFetch("/api/chat", {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({ message }),
+     });
+   export const getChatHistory = () => apiFetch("/api/chat/history");
+   export const clearChatHistory = () => apiFetch("/api/chat/history", { method: "DELETE" });
+
+   ※ axios를 사용하면 withCredentials: true 로 지정한다.
+
+ [챗봇 답변 표시] npm install react-markdown
+   import ReactMarkdown from "react-markdown";
+   <ReactMarkdown>{answer}</ReactMarkdown>
+   ※ LLM 답변은 신뢰할 수 없는 값이다. dangerouslySetInnerHTML과 rehype-raw는 사용하지 않는다.
+
+ [React로 옮길 화면] fastapiproject 화면 기준
+   홈       : GET /api/home 으로 벡터 DB 상태 표시, 기능 소개
+   와인 검색 : 검색어, 검색 대상, 결과 수(3/5/10), 최소/최대 가격, 재고 체크박스
+              결과 카드에 이름, 빈티지, 지역, 가격, 재고, 페어링, 테이스팅 노트, 유사도 점수 표시
+              예시 검색어 : 갈비찜과 어울리는 묵직한 레드, 샤또 마고 2002 가격,
+                           해산물에 어울리는 상큼한 화이트, 기념일에 마실 샴페인
+   와인 챗봇 : 첫 화면에서 GET /api/chat/history 로 대화 복원, [새 대화]는 DELETE
+              전송 중에는 버튼 비활성화 (답변까지 수십 초 걸릴 수 있음)
+              Enter 전송 시 한글 조합 중(event.nativeEvent.isComposing)이면 전송하지 않음
+              예시 질문 : 불고기에 어울리는 와인을 추천해줘, 샤또 마고 2002 가격과 재고 알려줘,
+                         20만원 이하 와인 3개 추천해줘, 보르도 와인 입문 영상도 찾아줘
+
+
+9. 실행 방법 (PowerShell)
+--------------------------------------------------------------------------------
+ cd D:\fastapiworkspace\reactbackend
+ .venv\Scripts\activate
+ pip install -r requirements.txt        (이미 설치되어 있으면 생략)
+ cd backend
+ python vectordb/create_vector_db.py    (이미 실행해 둠. 데이터가 바뀌면 다시 실행)
+ uvicorn main:app --reload
+ → 동작 확인 : http://localhost:8000/docs
+
+ ※ fastapiproject도 8000번 포트를 사용한다. 함께 실행하려면 uvicorn main:app --reload --port 8001
+   로 실행하고 vite.config.js의 target도 같은 포트로 바꾼다.
+
+
+10. 테스트
+--------------------------------------------------------------------------------
+ 테스트를 마친 뒤 테스트 파일(backend/tests/, backend/pytest.ini)은 삭제했다.
+ 아래는 삭제 전에 수행한 결과의 기록이다.
+
+ [수행 결과] 2026-11-02
+   자동 테스트 (가짜 LLM, 가짜 임베딩 사용)   112개 통과
+     CORS 16 / 보안 41 / 검색 23 / 챗봇 20 / 홈 3 / 전처리와 검색 조건 9
+   실제 서버 + 실제 OpenAI                    3개 통과
+     임베딩 검색 필터, 도구 호출, 쿠키로 대화 유지, 대화 삭제
+   실제 Chrome (headless) 에서 fetch 호출
+     localhost:5173 → API          전체 정상, 쿠키를 자바스크립트로 읽을 수 없음
+     127.0.0.1:5173 → 127.0.0.1 API  전체 정상
+     localhost:5999(미등록) → API    브라우저가 차단, 사전요청 없는 POST는 서버가 403 응답
+     127.0.0.1:5173 → localhost API  요청은 성공하나 쿠키 미전달 (8번의 주의사항)
+     Vite 프록시(/api) 경유          전체 정상
+   실제 프로세스 확인
+     uvicorn --reload 실행, 배포 설정(HTTPS용 쿠키, HSTS, /docs 숨김, 호출 제한 429,
+     413, 411), CORS_ORIGINS=* 일 때 서버 시작 거부
+
+ [확인하지 않은 항목]
+   · 실제 React 앱. 이 프로젝트에 React 코드가 없어, React가 호출하는 것과 같은 fetch를
+     테스트 페이지에서 실행해 확인했다.
+   · 실제 HTTPS 도메인 배포. 배포 설정은 응답 헤더까지만 확인했다.
+   · react-markdown 렌더링.
+
+
+11. 사용 라이브러리
+--------------------------------------------------------------------------------
+ 직접 사용하는 라이브러리이다. requirements.txt의 나머지는 이들의 의존성이다. (전체 126개)
+ fastapiproject와 같은 버전을 사용한다.
+
+ 웹 서버       fastapi 0.136.1, uvicorn[standard] 0.47.0, pydantic 2.14.2, python-dotenv 1.2.3
+ 보안          slowapi 0.1.10 (신규, 호출 횟수 제한)
+ 벡터 검색     chromadb 1.5.9, langchain-chroma 1.1.0, langchain-text-splitters 1.1.3,
+               openai 2.54.0
+ AI 에이전트   langchain 1.4.3, langchain-core 1.6.6, langchain-openai 1.6.7,
+               langgraph 1.2.12
+ 대화 기록     langgraph-checkpoint-sqlite 3.1.1, aiosqlite 0.22.1
+ 로더/도구     langchain-community 0.4.2, youtube-search 2.2.0
+ 테스트        pytest 9.2.0 (신규, 테스트 파일 삭제 후 앱에서는 사용하지 않음)
+
+ 제거 : Jinja2, MarkupSafe (템플릿), linkify-it-py (마크다운 변환)
+ ※ markdown-it-py는 rich 라이브러리의 의존성으로 남아 있지만 프로젝트에서 직접 사용하지 않는다.
+
+
+12. fastapiproject와 달라진 점
+--------------------------------------------------------------------------------
+ 항목             fastapiproject              reactbackend
+ ───────────────  ──────────────────────────  ────────────────────────────────
+ 화면             Jinja2 + CSS + JS           없음 (React 담당)
+ URL              /, /search, /chat 화면 포함 JSON API만 제공 (/api/...)
+ 챗봇 응답        answer + html               answer(마크다운)만
+ 대화 조회 응답    content + html               content만
+ 검색 결과        기본 항목                     price_value, stock_value 추가
+ 홈 상태          HTML에 포함                  GET /api/home
+ 쿠키             HttpOnly, Lax               설정 가능, Path=/api, 형식 검증 추가
+ 도구 오류        오류 내용을 LLM에 전달         로그에만 기록
+ LLM 호출         제한 없음(9999단계)           질문당 6회, OpenAI 응답 대기 60초
+ CORS, 보안       없음 (같은 출처)              6번 내용 전체
+ create_vector_db import하면 바로 실행         main()으로 분리
+
+ 그대로 사용 : 데이터 파일, 청킹/임베딩 방식, 검색 로직(wine_store.py),
+               에이전트 도구(wine_tools.py), 시스템 프롬프트, 모델 설정
+
+
+13. 주의사항
+--------------------------------------------------------------------------------
+ · 로그인 기능이 없다.
+     주소를 아는 사람은 누구나 API를 호출할 수 있고, 호출 제한으로 비용만 제어한다.
+     CORS는 브라우저의 규칙이므로 curl 같은 프로그램의 호출은 막지 못한다.
+     인터넷에 공개할 때는 로그인이나 OpenAI 사용 한도 설정을 함께 검토한다.
+ · 호출 제한의 범위
+     횟수를 서버 메모리에 저장하므로 서버를 재시작하면 초기화되고, 워커가 여러 개이면
+     워커별로 따로 계산된다. 여러 서버로 운영하면 Redis 저장소로 바꿔야 한다.
+ · create_vector_db.py 를 다시 실행했다면 서버를 재시작해야 한다.
+     실행 중인 서버는 벡터 인덱스를 메모리에 들고 있어 재시작 전까지 이전 벡터로 검색한다.
+ · 벡터 검색의 한계 (fastapiproject와 동일)
+     · 지역 필터는 없다. 정렬("가장 저렴한 와인")도 지원하지 않는다.
+     · 음식 페어링은 의미가 가까운 것을 찾을 뿐이므로 해당 음식이 아닌 와인이 나올 수 있다.
+     · 맛/음식 검색은 source_type을 Unstructured Data로 지정하면 더 정확하다.
+ · langchain-community 경고
+     "being sunset" DeprecationWarning이 출력될 수 있으나 동작에는 문제가 없다.
+ · PyCharm import 설정
+     코드는 backend 폴더를 기준으로 import 한다. (예: from common.config import BASE_DIR)
+     .idea/reactbackend.iml 에 backend를 Sources Root로 등록해 두었다.
+     common, chat, search 등에 "Install package"가 표시되어도 누르지 말 것.
+     같은 이름의 무관한 PyPI 패키지가 설치될 수 있다.
+ · 비용
+     임베딩(create_vector_db.py), 챗봇 질문, 검색어 임베딩은 OpenAI API 비용이 든다.
